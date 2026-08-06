@@ -45,6 +45,7 @@ from segm.engine import train_one_epoch, evaluate
 @click.option("--eval-freq", default=None, type=int)
 @click.option("--amp/--no-amp", default=False, is_flag=True)
 @click.option("--resume/--no-resume", default=True, is_flag=True)
+@click.option("--num-workers", default=10, type=int)
 def main(
     log_dir,
     dataset,
@@ -66,6 +67,7 @@ def main(
     eval_freq,
     amp,
     resume,
+    num_workers,
 ):
     # start distributed mode
     ptu.set_gpu_mode(True)
@@ -126,7 +128,7 @@ def main(
             batch_size=batch_size,
             normalization=model_cfg["normalization"],
             split="train",
-            num_workers=10,
+            num_workers=num_workers,
         ),
         algorithm_kwargs=dict(
             batch_size=batch_size,
