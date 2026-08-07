@@ -1,0 +1,3 @@
+root: /content/drive/MyDrive/segmenter_logs/
+logs:
+  seg-t: cityscapes_tiny/no_val_default_configs/log.txt
