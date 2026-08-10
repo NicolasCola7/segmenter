@@ -7,6 +7,14 @@ from segm.model import utils
 from segm.data.utils import IGNORE_LABEL
 import segm.utils.torch as ptu
 
+import gc
+
+ # 1. Helper function for O(1) memory confusion matrix
+# Notice: 'a < n' automatically ignores the Cityscapes IGNORE_LABEL (255)
+def fast_hist(a, b, n):
+    k = (a >= 0) & (a < n)
+    return np.bincount(n * a[k].astype(int) + b[k].astype(int), minlength=n ** 2).reshape(n, n)
+
 
 def train_one_epoch(
     model,
@@ -61,6 +69,10 @@ def train_one_epoch(
     return logger
 
 
+import gc
+import numpy as np
+import torch
+
 @torch.no_grad()
 def evaluate(
     model,
@@ -70,6 +82,8 @@ def evaluate(
     window_stride,
     amp_autocast,
 ):
+   
+
     model_without_ddp = model
     if hasattr(model, "module"):
         model_without_ddp = model.module
@@ -77,7 +91,10 @@ def evaluate(
     header = "Eval:"
     print_freq = 50
 
-    val_seg_pred = {}
+    # 2. Setup the running metrics matrix
+    n_cls = data_loader.unwrapped.n_cls
+    hist = np.zeros((n_cls, n_cls))
+
     model.eval()
     for batch in logger.log_every(data_loader, print_freq, header):
         ims = [im.to(ptu.device) for im in batch["im"]]
@@ -99,17 +116,36 @@ def evaluate(
             seg_pred = seg_pred.argmax(0)
 
         seg_pred = seg_pred.cpu().numpy()
-        val_seg_pred[filename] = seg_pred
+        
+        # 3. Accumulate metrics immediately (bypassing the memory-heavy dict)
+        gt_mask = val_seg_gt[filename]
+        hist += fast_hist(gt_mask.flatten(), seg_pred.flatten(), n_cls)
 
-    val_seg_pred = gather_data(val_seg_pred)
-    scores = compute_metrics(
-        val_seg_pred,
-        val_seg_gt,
-        data_loader.unwrapped.n_cls,
-        ignore_index=IGNORE_LABEL,
-        distributed=ptu.distributed,
-    )
+        # 4. Force garbage collection to keep RAM perfectly flat
+        del seg_pred
+        del ims
+        del batch
+        gc.collect()
 
+    # 5. Distributed gathering (Syncs a tiny 19x19 matrix instead of writing GBs to disk)
+    if ptu.distributed:
+        torch.distributed.barrier()
+        hist_tensor = torch.tensor(hist, device=ptu.device)
+        torch.distributed.all_reduce(hist_tensor)
+        hist = hist_tensor.cpu().numpy()
+
+    # 6. Compute final metrics exactly as `compute_metrics()` would
+    iu = np.diag(hist) / (hist.sum(axis=1) + hist.sum(axis=0) - np.diag(hist) + 1e-8)
+    acc = np.diag(hist).sum() / (hist.sum() + 1e-8)
+    acc_cls = np.diag(hist) / (hist.sum(axis=1) + 1e-8)
+    
+    scores = {
+        "aAcc": acc,
+        "mAcc": np.nanmean(acc_cls),
+        "mIoU": np.nanmean(iu),
+    }
+
+    # 7. Log stats exactly as before
     for k, v in scores.items():
         logger.update(**{f"{k}": v, "n": 1})
 

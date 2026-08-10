@@ -49,6 +49,9 @@ def gather_data(seg_pred, tmp_dir=None):
     prediction and ground truth are stored in a common tmp directory
     and loaded on the master node to compute metrics
     """
+    if not getattr(ptu, "distributed", False):
+        return seg_pred
+    
     if tmp_dir is None:
         tmpprefix = os.path.expandvars("$DATASET/temp")
     else:

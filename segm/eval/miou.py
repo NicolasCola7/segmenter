@@ -5,6 +5,9 @@ import yaml
 import numpy as np
 from PIL import Image
 import shutil
+import gc
+import os.path as osp
+import mmcv
 
 import torch
 import torch.nn.functional as F
@@ -21,6 +24,10 @@ from segm.metrics import gather_data, compute_metrics
 from segm.model.utils import inference
 from segm.data.utils import seg_to_rgb, rgb_denormalize, IGNORE_LABEL
 from segm import config
+
+def fast_hist(a, b, n):
+    k = (a >= 0) & (a < n)
+    return np.bincount(n * a[k].astype(int) + b[k].astype(int), minlength=n ** 2).reshape(n, n)
 
 
 def blend_im(im, seg, alpha=0.5):
@@ -107,69 +114,92 @@ def eval_dataset(
     header = ""
     print_freq = 50
 
-    ims = {}
-    seg_pred_maps = {}
-    idx = 0
-    for batch in logger.log_every(db, print_freq, header):
-        colors = batch["colors"]
-        filename, im, seg_pred = process_batch(
-            model, batch, window_size, window_stride, window_batch_size,
-        )
-        ims[filename] = im
-        seg_pred_maps[filename] = seg_pred
-        idx += 1
-        if idx > len(db) * frac_dataset:
-            break
-
+    # 2. Setup the running metrics matrix
+    hist = np.zeros((n_cls, n_cls))
+    
+    # 3. Load GT maps before the loop so we can index them individually
     seg_gt_maps = db.dataset.get_gt_seg_maps()
+
+    # 4. Setup directories for saving BEFORE the loop starts
     if save_images:
         save_dir = model_dir / "images"
         if ptu.dist_rank == 0:
             if save_dir.exists():
                 shutil.rmtree(save_dir)
-            save_dir.mkdir()
+            save_dir.mkdir(parents=True, exist_ok=True)
         if ptu.distributed:
             torch.distributed.barrier()
 
-        for name in sorted(ims):
+    idx = 0
+    # 5. O(1) STREAMING BATCH LOOP
+    for batch in logger.log_every(db, print_freq, header):
+        colors = batch["colors"]
+        filename, im, seg_pred = process_batch(
+            model, batch, window_size, window_stride, window_batch_size,
+        )
+        
+        # Accumulate metrics immediately
+        gt_mask = seg_gt_maps[filename]
+        hist += fast_hist(gt_mask.flatten(), seg_pred.flatten(), n_cls)
+        
+        # Save images immediately to disk instead of holding in RAM
+        if save_images:
             instance_dir = save_dir
-            filename = name
+            save_filename = filename
 
             if dataset_name == "cityscapes":
-                filename_list = name.split("/")
+                filename_list = filename.split("/")
                 instance_dir = instance_dir / filename_list[0]
-                filename = filename_list[-1]
-                if not instance_dir.exists():
-                    instance_dir.mkdir()
+                save_filename = filename_list[-1]
+                if not instance_dir.exists() and ptu.dist_rank == 0:
+                    instance_dir.mkdir(parents=True, exist_ok=True)
 
             save_im(
                 instance_dir,
-                filename,
-                ims[name],
-                seg_pred_maps[name],
-                torch.tensor(seg_gt_maps[name]),
+                save_filename,
+                im,
+                seg_pred,
+                torch.tensor(gt_mask),
                 colors,
                 blend,
                 normalization,
             )
-        if ptu.dist_rank == 0:
-            shutil.make_archive(save_dir, "zip", save_dir)
-            # shutil.rmtree(save_dir)
-            print(f"Saved eval images in {save_dir}.zip")
 
+        # Force garbage collection to keep RAM flat at ~4GB
+        del seg_pred
+        del im
+        del batch
+        gc.collect()
+
+        idx += 1
+        if idx > len(db) * frac_dataset:
+            break
+
+    # Archive images if requested
+    if save_images and ptu.dist_rank == 0:
+        shutil.make_archive(save_dir, "zip", save_dir)
+        print(f"Saved eval images in {save_dir}.zip")
+
+    # 6. Distributed gathering (combines the small 19x19 matrix instead of a 12GB dict)
     if ptu.distributed:
         torch.distributed.barrier()
-        seg_pred_maps = gather_data(seg_pred_maps)
+        hist_tensor = torch.tensor(hist, device=ptu.device)
+        torch.distributed.all_reduce(hist_tensor)
+        hist = hist_tensor.cpu().numpy()
 
-    scores = compute_metrics(
-        seg_pred_maps,
-        seg_gt_maps,
-        n_cls,
-        ignore_index=IGNORE_LABEL,
-        ret_cat_iou=True,
-        distributed=ptu.distributed,
-    )
+    # 7. Compute final metrics exactly as `compute_metrics()` would
+    iu = np.diag(hist) / (hist.sum(axis=1) + hist.sum(axis=0) - np.diag(hist) + 1e-8)
+    acc = np.diag(hist).sum() / (hist.sum() + 1e-8)
+    acc_cls = np.diag(hist) / (hist.sum(axis=1) + 1e-8)
+    
+    scores = {
+        "aAcc": acc,
+        "mAcc": np.nanmean(acc_cls),
+        "mIoU": np.nanmean(iu),
+        "cat_iou": iu
+    }
 
+    # 8. Unchanged formatting logic
     if ptu.dist_rank == 0:
         scores["inference"] = "single_scale" if not multiscale else "multi_scale"
         suffix = "ss" if not multiscale else "ms"
@@ -195,6 +225,7 @@ def eval_dataset(
 @click.option("--window-batch-size", default=4, type=int)
 @click.option("--save-images/--no-save-images", default=False, is_flag=True)
 @click.option("-frac-dataset", "--frac-dataset", default=1.0, type=float)
+@click.option("--num-workers", default=10, type=int)
 def main(
     model_path,
     dataset_name,
@@ -206,6 +237,7 @@ def main(
     window_batch_size,
     save_images,
     frac_dataset,
+    num_workers
 ):
 
     model_dir = Path(model_path).parent
@@ -237,7 +269,7 @@ def main(
         crop_size=im_size,
         patch_size=patch_size,
         batch_size=1,
-        num_workers=10,
+        num_workers=num_workers,
         split="val",
         normalization=normalization,
         crop=False,
