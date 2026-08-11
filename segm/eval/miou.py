@@ -138,8 +138,16 @@ def eval_dataset(
             model, batch, window_size, window_stride, window_batch_size,
         )
         
-        # Accumulate metrics immediately
+        # --- FIX: Convert PyTorch Tensors to NumPy Arrays ---
+        if torch.is_tensor(seg_pred):
+            seg_pred = seg_pred.cpu().numpy()
+            
         gt_mask = seg_gt_maps[filename]
+        if torch.is_tensor(gt_mask):
+            gt_mask = gt_mask.cpu().numpy()
+        # ----------------------------------------------------
+        
+        # Accumulate metrics immediately
         hist += fast_hist(gt_mask.flatten(), seg_pred.flatten(), n_cls)
         
         # Save images immediately to disk instead of holding in RAM
@@ -158,7 +166,7 @@ def eval_dataset(
                 instance_dir,
                 save_filename,
                 im,
-                seg_pred,
+                seg_pred,  # Now safely a numpy array
                 torch.tensor(gt_mask),
                 colors,
                 blend,
