@@ -1,4 +1,3 @@
-from asyncio import log
 import json
 from pathlib import Path
 import numpy as np
@@ -53,11 +52,10 @@ def plot_logs(logs, x_key, y_key, size, vmin, vmax, epochs):
     ax.grid(True, alpha=0.5)
     ax.set_ylim(m - delta, M + delta)
 
-    # SWAPPED: Save the figure before calling show()
+    plt.show()
     fig.savefig(
         "plot.png", bbox_inches="tight", pad_inches=0.1, transparent=False, dpi=300
     )
-    # plt.show() # Commented this out entirely so it doesn't crash on Colab!
     plt.close(fig)
 
 
@@ -70,10 +68,8 @@ def print_logs(logs, x_key, y_key, last_log_idx=None):
         log_idx = last_log_idx
         if log_idx is None:
             log_idx = len(log) - 1
-        while log_idx < len(log) and y_keys[0] not in log[log_idx]:
-            log_idx += 1
-        if log_idx >= len(log):
-            break
+        while y_keys[0] not in log[log_idx]:
+            log_idx -= 1
         last_log = log[log_idx]
         log_x = last_log[x_key]
         log_y = last_log[y_keys[0]]
